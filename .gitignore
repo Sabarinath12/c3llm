@@ -1,0 +1,6 @@
+build/
+models/
+tools/
+.claude/
+/node
+/odin_gguf_engine_plan.md

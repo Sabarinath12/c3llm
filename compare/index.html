@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>c3llm vs llama.cpp</title>
+<style>
+  :root { --bg: #f6f6f4; --panel: #fff; --text: #1c1c1a; --muted: #6b6b66; --line: #d9d9d4; --accent: #2456c9; --diff: #ffe08a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161615; --panel: #1f1f1e; --text: #ececea; --muted: #9a9a94; --line: #383836; --accent: #7aa2ff; --diff: #6b5200; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px 16px; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, sans-serif; }
+  main { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 16px; color: var(--muted); }
+  form { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 16px; }
+  label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+  label.grow { flex: 1 1 320px; }
+  textarea, input { font: inherit; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px; }
+  textarea { resize: vertical; min-height: 44px; }
+  input[type=number] { width: 90px; }
+  button { font: inherit; padding: 9px 18px; border: 0; border-radius: 6px; background: var(--accent); color: #fff; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  .verdict { padding: 10px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); margin-bottom: 16px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 700px) { .grid { grid-template-columns: 1fr; } }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px; min-width: 0; }
+  h2 { font-size: 15px; margin: 0 0 2px; }
+  .stats { font-size: 13px; color: var(--muted); min-height: 20px; font-variant-numeric: tabular-nums; }
+  .big { font-size: 22px; color: var(--text); font-weight: 600; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 14px/1.5 ui-monospace, Consolas, monospace; margin: 10px 0 0; min-height: 120px; }
+  mark { background: var(--diff); color: inherit; }
+  .error { color: #c62828; }
+</style>
+</head>
+<body>
+<main id="root"></main>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script>
+const { useState, useEffect, createElement: h } = React;
+const ENGINES = [
+  { id: 'c3', name: 'c3llm (our C3 engine)' },
+  { id: 'llama', name: 'llama.cpp (llama-server)' },
+];
+const EMPTY = { text: '', stats: null, state: 'idle' };
+
+async function runEngine(engine, message, maxTokens, update) {
+  const res = await fetch('/api/run', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ engine, message, maxTokens }),
+  });
+  if (!res.ok) return update((r) => ({ ...r, state: 'done', stats: { error: `server answered ${res.status}` } }));
+  const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += value;
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    for (const line of lines) {
+      if (!line) continue;
+      const event = JSON.parse(line);
+      if (event.text) update((r) => ({ ...r, text: r.text + event.text }));
+      if (event.done) update((r) => ({ ...r, state: 'done', stats: event }));
+    }
+  }
+}
+
+function commonPrefix(a, b) {
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  return i;
+}
+
+function Panel({ engine, result, same }) {
+  const s = result.stats;
+  const text = result.text.trim();
+  return h('section', { 'aria-label': engine.name },
+    h('h2', null, engine.name),
+    h('div', { className: 'stats', 'aria-live': 'polite' },
+      result.state === 'running' ? 'generating…'
+      : !s ? 'not run yet'
+      : s.error ? h('span', { className: 'error' }, s.error)
+      : [h('span', { className: 'big', key: 1 }, s.genTps.toFixed(1)), ` tok/s · ${s.genTokens} tokens generated · prompt ${s.promptTokens} tokens at ${s.promptTps.toFixed(1)} tok/s`]),
+    h('pre', null, same == null ? text : [text.slice(0, same), h('mark', { key: 1 }, text.slice(same))]));
+}
+
+function App() {
+  const [message, setMessage] = useState('Why is the sky blue?');
+  const [maxTokens, setMaxTokens] = useState(80);
+  const [results, setResults] = useState({ c3: EMPTY, llama: EMPTY });
+  const [running, setRunning] = useState(false);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    if (ready) return;
+    const check = () => fetch('/api/ready').then((r) => r.json()).then((j) => setReady(j.ready), () => {});
+    check();
+    const timer = setInterval(check, 1000);
+    return () => clearInterval(timer);
+  }, [ready]);
+
+  async function run(e) {
+    e.preventDefault();
+    setRunning(true);
+    setResults({ c3: EMPTY, llama: EMPTY });
+    // one after the other, so each engine gets the whole CPU while it is timed
+    for (const { id } of ENGINES) {
+      const update = (fn) => setResults((all) => ({ ...all, [id]: fn(all[id]) }));
+      update((r) => ({ ...r, state: 'running' }));
+      await runEngine(id, message, Number(maxTokens), update)
+        .catch((err) => update((r) => ({ ...r, state: 'done', stats: { error: err.message } })));
+    }
+    setRunning(false);
+  }
+
+  const { c3, llama } = results;
+  const bothDone = c3.state === 'done' && llama.state === 'done' && !c3.stats.error && !llama.stats.error;
+  const a = c3.text.trim(), b = llama.text.trim();
+  const same = bothDone ? commonPrefix(a, b) : null;
+  const identical = bothDone && a === b;
+  let verdict = null;
+  if (bothDone) {
+    const ratio = llama.stats.genTps / c3.stats.genTps;
+    const speed = ratio >= 1 ? `llama.cpp is ${ratio.toFixed(1)}× faster` : `c3llm is ${(1 / ratio).toFixed(1)}× faster`;
+    const text = identical ? 'Outputs are identical'
+      : `Outputs match for the first ${same} characters, then differ (highlighted)`;
+    verdict = h('div', { className: 'verdict', role: 'status' }, `${text}. ${speed} at generating.`);
+  }
+
+  return h(React.Fragment, null,
+    h('h1', null, 'c3llm vs llama.cpp'),
+    h('p', { className: 'sub' }, 'Same model file, same prompt, both picking the most likely token each step, run one after the other.'),
+    h('form', { onSubmit: run },
+      h('label', { className: 'grow' }, 'Message',
+        h('textarea', { value: message, rows: 2, maxLength: 4000, required: true, onChange: (e) => setMessage(e.target.value) })),
+      h('label', null, 'Max tokens',
+        h('input', { type: 'number', min: 1, max: 512, value: maxTokens, required: true, onChange: (e) => setMaxTokens(e.target.value) })),
+      h('button', { disabled: running || !ready }, !ready ? 'Loading llama.cpp…' : running ? 'Running…' : 'Run both')),
+    verdict,
+    h('div', { className: 'grid' },
+      ENGINES.map((engine) => h(Panel, { key: engine.id, engine, result: results[engine.id], same: identical ? null : same }))));
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(h(App));
+</script>
+</body>
+</html>
